@@ -1,0 +1,36 @@
+# --- Python ---------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# --- converter output -----------------------------------------------------
+# Everything the pipeline generates is reproducible from the asset pack;
+# none of it belongs in the repo (out/ alone reaches several GB).
+out/
+UEProj/
+godot_test/
+
+# generated 3D assets / textures, wherever they land
+*.glb
+*.gltf
+*.bin
+*.fbx
+*.uasset
+*.umap
+
+# logs and intermediate dumps
+*.log
+scene.json
+bounds.json
+masters.json
+probe_*.json
+
+# --- OS / editors ---------------------------------------------------------
+Thumbs.db
+desktop.ini
+.DS_Store
+.vscode/
+.idea/
