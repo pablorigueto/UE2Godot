@@ -162,6 +162,15 @@ TEX_EXPORTERS = ("TextureExporterPNG", "TextureExporterTGA", "TextureExporterBMP
 def export_texture(tex):
     if tex is None:
         return None
+    # Only a plain Texture2D. UTextureExporterPNG::SupportsTexture asserts (a hard
+    # engine crash, not a catchable exception) on textures whose editor Source is
+    # not a plain 2D image -- CurveLinearColorAtlas, which subclasses Texture2D
+    # and is what the Water plugin's master materials reference, is exactly that
+    # case. isinstance() would let those through, so match the class exactly.
+    if type(tex).__name__ != "Texture2D":
+        warn("skipping %s: unsupported texture class %s"
+             % (tex.get_name(), type(tex).__name__))
+        return None
     key = tex.get_path_name().split(".")[0]
     if key in _exported_textures:
         return key
@@ -184,6 +193,20 @@ def export_texture(tex):
         entry["height"] = int(tex.blueprint_get_size_y())
     except Exception:
         pass
+
+    # Float source formats are the other thing UTextureExporterPNG::SupportsTexture
+    # asserts on. /Water/Textures/Caustics/Caustics_Tiling_01_HDR (TC_HDR) reaches
+    # here through the water master's parameter defaults and takes the whole
+    # editor down with it -- an assertion, so there is nothing to catch.
+    cs = str(entry.get("compression") or "")
+    if "HDR" in cs or "Float" in cs:
+        warn("skipping %s: %s cannot be exported as PNG" % (name, cs))
+        entry["file"] = None
+        return key
+
+    # named BEFORE the exporter runs: if the engine asserts inside it the process
+    # dies without a Python traceback, and this line is what identifies the asset
+    log("  texture %s (%s)" % (name, entry["compression"]))
 
     for exp_cls in TEX_EXPORTERS:
         cls = getattr(unreal, exp_cls, None)
@@ -228,6 +251,56 @@ def _read_params(mic, entry):
         entry["vectors"][pname] = [float(v.r), float(v.g), float(v.b), float(v.a)]
 
 
+def _read_master_defaults(master, entry):
+    """Parameter DEFAULTS declared by the master material.
+
+    _read_params only sees what a MIC actually overrides. Anything left at its
+    default is absent from the instance, so without this the value is lost --
+    e.g. MM_Glass declares the opacity of MI_Lighthouse_Glass_01, which overrides
+    nothing: the glass then falls back to the base texture's alpha, which is 0
+    everywhere, and the lighthouse windows disappear.
+
+    Read first, so any override from the MIC chain still wins.
+    """
+    mel = getattr(unreal, "MaterialEditingLibrary", None)
+    if mel is None:
+        return
+    # Kept SEPARATELY as well as merged: knowing a value is only the master's
+    # default is what tells the Blender side that a material is not really
+    # emissive. MM_Props defaults Emiss Texture to T_Brick_Single_1_B with
+    # Emiss Value 1.0, so merging alone made every prop -- boat, pier, barrel,
+    # the lighthouse woodwork -- glow orange.
+    dflt = entry.setdefault("master_defaults",
+                            {"scalars": {}, "vectors": {}, "textures": {}})
+    try:
+        for n in mel.get_scalar_parameter_names(master):
+            try:
+                v = float(mel.get_material_default_scalar_parameter_value(master, n))
+                entry["scalars"][str(n)] = v
+                dflt["scalars"][str(n)] = v
+            except Exception:
+                pass
+        for n in mel.get_vector_parameter_names(master):
+            try:
+                c = mel.get_material_default_vector_parameter_value(master, n)
+                v = [float(c.r), float(c.g), float(c.b), float(c.a)]
+                entry["vectors"][str(n)] = v
+                dflt["vectors"][str(n)] = v
+            except Exception:
+                pass
+        for n in mel.get_texture_parameter_names(master):
+            try:
+                t = mel.get_material_default_texture_parameter_value(master, n)
+                if isinstance(t, unreal.Texture2D):
+                    k = export_texture(t)
+                    entry["textures"][str(n)] = k
+                    dflt["textures"][str(n)] = k
+            except Exception:
+                pass
+    except Exception as e:
+        warn("master defaults %s: %s" % (master.get_name(), e))
+
+
 def export_material(mat):
     if mat is None:
         return None
@@ -251,7 +324,9 @@ def export_material(mat):
     master = cur if isinstance(cur, unreal.Material) else None
     entry["parent"] = master.get_path_name().split(".")[0] if master else None
 
-    # master first, leaf last, so the most specific values win
+    # master defaults first, then master-most MIC, then leaf: most specific wins
+    if master is not None:
+        _read_master_defaults(master, entry)
     for mic in reversed(chain):
         try:
             _read_params(mic, entry)
@@ -404,10 +479,30 @@ def main():
         if idx % 20 == 0:
             log("  actor %d/%d" % (idx, len(actors)))
 
+    # Landscape: its components are LandscapeComponents, not StaticMeshComponents,
+    # so the actor never reaches collect_mesh_component and the terrain is absent
+    # from this export -- the geometry comes from ue_bake_extras.py, through UE's
+    # own glTF exporter. Its MATERIAL, though, is an ordinary material instance
+    # (MI_Landscape_01 of MM_Landscape), so it is exported here like any other and
+    # blender_build.py textures the imported terrain with it.
+    land_mat = None
+    for a in actors:
+        if not a.get_class().get_name().startswith("Landscape"):
+            continue
+        try:
+            m = a.get_editor_property("landscape_material")
+        except Exception:
+            continue
+        if m is not None:
+            land_mat = export_material(m)
+            log("landscape material: %s" % land_mat)
+            break
+
     scene = {
         "level": LEVEL,
         "space": "unreal",           # cm, Z-up, left-handed
         "engine": "UE5.8",
+        "landscape_material": land_mat,
         "nodes": nodes,
         "meshes": _exported_meshes,
         "materials": _exported_materials,

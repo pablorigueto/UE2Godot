@@ -112,6 +112,13 @@ def main():
     ap.add_argument("--empty-slot", choices=["first", "keep"], default="first",
                     help="material slot left empty in UE: use the mesh's first "
                          "valid material (first) or leave it unassigned as UE does (keep)")
+    ap.add_argument("--extras", choices=["0", "1"], default="1",
+                    help="bake the actors the main path cannot express -- landscape, "
+                         "sky sphere, single-layer water -- with UE's own glTF "
+                         "exporter and merge them (default 1)")
+    ap.add_argument("--bake-size", default="512",
+                    help="resolution of the baked landscape/sky/water textures "
+                         "(per landscape component; default 512)")
     ap.add_argument("--unreal", default=None, help="path to UnrealEditor-Cmd.exe")
     ap.add_argument("--blender", default=None, help="path to blender.exe")
     ap.add_argument("--skip-ue", action="store_true",
@@ -134,20 +141,40 @@ def main():
     print("Blender:", bl)
     print("Output :", out)
 
-    env = dict(os.environ, UE2G_LEVEL=args.level, UE2G_OUT=out)
+    env = dict(os.environ, UE2G_LEVEL=args.level, UE2G_OUT=out,
+               UE2G_BAKE_SIZE=str(args.bake_size))
 
     if not args.skip_ue:
-        print("\n[1/3] exporting from Unreal (slow: it builds the mesh DDC)")
+        print("\n[1/4] exporting from Unreal (slow: it builds the mesh DDC)")
         uproj = make_project(proj, args.content)
+        # Remove it first: the engine can die on an assertion inside an exporter,
+        # which leaves no Python traceback and no scene.json. Merely testing that
+        # the file EXISTS would then happily rebuild from a previous run's export.
+        scene = os.path.join(out, "scene.json")
+        if os.path.exists(scene):
+            os.remove(scene)
         rc = run([ue, uproj, "-run=pythonscript",
                   "-script=%s" % os.path.join(SCRIPTS, "ue_export.py"),
                   "-unattended", "-nosplash", "-stdout", "-FullStdOutLogOutput"],
                  os.path.join(out, "export.log"), env)
         tail_tag(os.path.join(out, "export.log"), "[UE2G] ")
-        if not os.path.exists(os.path.join(out, "scene.json")):
+        if not os.path.exists(scene):
             sys.exit("UE export failed (rc=%s) -- see out/export.log" % rc)
 
-    print("\n[2/3] rebuilding in Blender and writing the GLB")
+        if args.extras == "1":
+            # -AllowCommandletRendering: baking material inputs to textures needs
+            # the renderer, which a commandlet does not start by default.
+            print("\n[2/4] baking landscape / sky / water with UE's glTF exporter")
+            rc = run([ue, uproj, "-run=pythonscript",
+                      "-script=%s" % os.path.join(SCRIPTS, "ue_bake_extras.py"),
+                      "-unattended", "-nosplash", "-stdout",
+                      "-FullStdOutLogOutput", "-AllowCommandletRendering"],
+                     os.path.join(out, "bake_extras.log"), env)
+            tail_tag(os.path.join(out, "bake_extras.log"), "[XTRA] ")
+            if not os.path.exists(os.path.join(out, "extras", "extras.gltf")):
+                print("  !! nothing baked (rc=%s) -- see out/bake_extras.log" % rc)
+
+    print("\n[3/4] rebuilding in Blender and writing the GLB")
     glb = os.path.join(out, os.path.basename(args.level) + ".glb")
     rc = run([bl, "--background", "--factory-startup", "--python",
               os.path.join(SCRIPTS, "blender_build.py"), "--",
@@ -156,13 +183,14 @@ def main():
               "--flip-green", args.flip_green,
               "--lights", args.lights,
               "--sun-scale", str(args.sun_scale),
-              "--empty-slot", args.empty_slot],
+              "--empty-slot", args.empty_slot,
+              "--extras", args.extras],
              os.path.join(out, "blender.log"))
     tail_tag(os.path.join(out, "blender.log"), "[B2G] ")
     if not os.path.exists(glb):
         sys.exit("Blender build failed (rc=%s) -- see out/blender.log" % rc)
 
-    print("\n[3/3] summary")
+    print("\n[4/4] summary")
     subprocess.run([sys.executable, os.path.join(SCRIPTS, "inspect_glb.py"), glb])
 
     if args.verify:
